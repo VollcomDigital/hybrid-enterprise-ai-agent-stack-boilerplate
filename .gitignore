@@ -7,3 +7,4 @@
 *.pyo
 *.pyd
 mcp-servers/n8n-bridge/.venv/
+**/*.egg-info/

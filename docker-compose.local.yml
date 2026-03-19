@@ -1,0 +1,287 @@
+name: hybrid-ai-agent-stack-local
+
+x-local-runtime: &local_runtime
+  restart: unless-stopped
+  user: "${APP_UID:-1000}:${APP_GID:-1000}"
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=256m
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  traefik:
+    <<: *local_runtime
+    image: traefik:v3.3
+    command:
+      - --configFile=/etc/traefik/traefik.yml
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./infrastructure/traefik/traefik.local.yml:/etc/traefik/traefik.yml:ro
+      - ./infrastructure/traefik/dynamic:/etc/traefik/dynamic:ro
+    networks:
+      - proxy-tier
+      - app-tier
+
+  openwork:
+    <<: *local_runtime
+    image: ${OPENWORK_IMAGE}
+    environment:
+      PORT: "${OPENWORK_PORT:-3000}"
+      OPENCLAW_BASE_URL: http://openclaw:${OPENCLAW_PORT:-18789}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "${OPENWORK_PORT:-3000}"
+    depends_on:
+      - openclaw
+    volumes:
+      - ./frontend/openwork:/workspace/frontend/openwork:rw
+    networks:
+      - proxy-tier
+      - app-tier
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=hybrid_local_proxy_tier
+      - traefik.http.routers.openwork.rule=Host(`${OPENWORK_HOST}`)
+      - traefik.http.routers.openwork.entrypoints=web
+      - traefik.http.routers.openwork.middlewares=local-security-headers@file
+      - traefik.http.services.openwork.loadbalancer.server.port=${OPENWORK_PORT:-3000}
+
+  openclaw:
+    <<: *local_runtime
+    image: ${OPENCLAW_IMAGE}
+    environment:
+      LOCAL_LLM_BASE_URL: ${LOCAL_LLM_BASE_URL}
+      LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL}
+      MCP_N8N_URL: http://mcp-server-n8n:8000/mcp
+      NEMOCLAW_BASE_URL: http://nemoclaw:8080
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+      OTEL_SERVICE_NAME: openclaw
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "${OPENCLAW_PORT:-18789}"
+    depends_on:
+      - nemoclaw
+      - mcp-server-n8n
+      - qdrant
+    volumes:
+      - ./backend/openclaw:/workspace/backend/openclaw:rw
+      - openclaw-data:/data
+    networks:
+      - app-tier
+      - ai-tier
+
+  nemoclaw:
+    <<: *local_runtime
+    image: ${NEMOCLAW_IMAGE}
+    environment:
+      OPENSHELL_SANDBOX_ROOT: /sandbox
+      OTEL_SERVICE_NAME: nemoclaw
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "8080"
+    volumes:
+      - ./backend/nemoclaw:/workspace/backend/nemoclaw:rw
+      - nemoclaw-data:/sandbox
+    networks:
+      - app-tier
+      - ai-tier
+
+  vllm:
+    <<: *local_runtime
+    profiles:
+      - windows
+    image: ${VLLM_IMAGE}
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --model
+      - ${VLLM_MODEL}
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-8192}
+    environment:
+      HF_HOME: /home/app/.cache/huggingface
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "8000"
+    shm_size: "8gb"
+    volumes:
+      - vllm-cache:/home/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+    networks:
+      - ai-tier
+
+  ollama:
+    <<: *local_runtime
+    profiles:
+      - mac
+    image: ${OLLAMA_IMAGE}
+    platform: linux/arm64
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h
+      TZ: ${TZ:-UTC}
+    expose:
+      - "11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - ai-tier
+
+  1password-connect-api:
+    <<: *local_runtime
+    image: 1password/connect-api:latest
+    environment:
+      OP_HTTP_PORT: "8080"
+      OP_LOG_LEVEL: info
+      OP_SESSION: /home/opuser/.op/1password-credentials.json
+      TZ: ${TZ:-UTC}
+    expose:
+      - "8080"
+    volumes:
+      - ${OP_CONNECT_CREDENTIALS_FILE}:/home/opuser/.op/1password-credentials.json:ro
+    networks:
+      - app-tier
+
+  1password-connect-sync:
+    <<: *local_runtime
+    image: 1password/connect-sync:latest
+    environment:
+      OP_HTTP_PORT: "8080"
+      OP_LOG_LEVEL: info
+      OP_SESSION: /home/opuser/.op/1password-credentials.json
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${OP_CONNECT_CREDENTIALS_FILE}:/home/opuser/.op/1password-credentials.json:ro
+    depends_on:
+      - 1password-connect-api
+    networks:
+      - app-tier
+
+  postgres:
+    <<: *local_runtime
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER}
+      TZ: ${TZ:-UTC}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - db-tier
+
+  n8n:
+    <<: *local_runtime
+    image: n8nio/n8n:latest
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_PORT: "5432"
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: ${N8N_HOST}
+      N8N_PROTOCOL: http
+      N8N_SECURE_COOKIE: "false"
+      WEBHOOK_URL: http://${N8N_HOST}/
+      TZ: ${TZ:-UTC}
+    expose:
+      - "5678"
+    depends_on:
+      - postgres
+    volumes:
+      - n8n-data:/home/node/.n8n
+    networks:
+      - proxy-tier
+      - app-tier
+      - db-tier
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=hybrid_local_proxy_tier
+      - traefik.http.routers.n8n.rule=Host(`${N8N_HOST}`)
+      - traefik.http.routers.n8n.entrypoints=web
+      - traefik.http.routers.n8n.middlewares=local-security-headers@file
+      - traefik.http.services.n8n.loadbalancer.server.port=5678
+
+  mcp-server-n8n:
+    <<: *local_runtime
+    build:
+      context: ./mcp-servers/n8n-bridge
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      N8N_BASE_URL: http://n8n:5678
+      OP_CONNECT_URL: http://1password-connect-api:8080
+      OP_CONNECT_TOKEN: ${OP_CONNECT_TOKEN}
+      OTEL_SERVICE_NAME: mcp-server-n8n
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "8000"
+    volumes:
+      - ./mcp-servers/n8n-bridge/src:/app/src:rw
+      - ./mcp-servers/n8n-bridge/tests:/app/tests:rw
+    depends_on:
+      - n8n
+      - 1password-connect-api
+    networks:
+      - app-tier
+
+  qdrant:
+    <<: *local_runtime
+    image: qdrant/qdrant:latest
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - ai-tier
+
+volumes:
+  openclaw-data:
+  nemoclaw-data:
+  n8n-data:
+  postgres-data:
+  qdrant-data:
+  vllm-cache:
+  ollama-data:
+
+networks:
+  proxy-tier:
+    name: hybrid_local_proxy_tier
+    internal: false
+  app-tier:
+    name: hybrid_local_app_tier
+    internal: true
+  db-tier:
+    name: hybrid_local_db_tier
+    internal: true
+  ai-tier:
+    name: hybrid_local_ai_tier
+    internal: true

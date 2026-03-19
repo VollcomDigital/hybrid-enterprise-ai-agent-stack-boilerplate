@@ -1,0 +1,314 @@
+name: hybrid-ai-agent-stack
+
+x-runtime-defaults: &runtime_defaults
+  restart: unless-stopped
+  user: "${APP_UID:-1000}:${APP_GID:-1000}"
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=256m
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  traefik:
+    <<: *runtime_defaults
+    image: traefik:v3.3
+    command:
+      - --configFile=/etc/traefik/traefik.yml
+      - --certificatesresolvers.letsencrypt.acme.email=${TRAEFIK_ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./infrastructure/traefik/traefik.prod.yml:/etc/traefik/traefik.yml:ro
+      - ./infrastructure/traefik/dynamic:/etc/traefik/dynamic:ro
+      - traefik-acme:/letsencrypt
+    networks:
+      - proxy-tier
+      - app-tier
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=hybrid_proxy_tier
+      - traefik.http.routers.traefik-dashboard.rule=Host(`traefik.${DOMAIN}`)
+      - traefik.http.routers.traefik-dashboard.entrypoints=websecure
+      - traefik.http.routers.traefik-dashboard.tls.certresolver=letsencrypt
+      - traefik.http.routers.traefik-dashboard.middlewares=entra-errors@docker,entra-auth@docker,security-headers@file
+      - traefik.http.routers.traefik-dashboard.service=api@internal
+
+  sso:
+    <<: *runtime_defaults
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.8.1
+    command:
+      - --config=/etc/oauth2-proxy/oauth2-proxy.cfg
+    environment:
+      OAUTH2_PROXY_CLIENT_ID: ${ENTRA_CLIENT_ID}
+      OAUTH2_PROXY_CLIENT_SECRET: ${ENTRA_CLIENT_SECRET}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_COOKIE_SECRET}
+      OAUTH2_PROXY_COOKIE_DOMAINS: .${DOMAIN}
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_OIDC_ISSUER_URL: https://login.microsoftonline.com/${ENTRA_TENANT_ID}/v2.0
+      OAUTH2_PROXY_REDIRECT_URL: https://${SSO_HOST}/oauth2/callback
+      OAUTH2_PROXY_WHITELIST_DOMAINS: .${DOMAIN}
+      OAUTH2_PROXY_ALLOWED_GROUPS: ${ENTRA_ALLOWED_GROUPS:-}
+    expose:
+      - "4180"
+    volumes:
+      - ./infrastructure/sso/oauth2-proxy.cfg:/etc/oauth2-proxy/oauth2-proxy.cfg:ro
+    networks:
+      - proxy-tier
+      - app-tier
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=hybrid_proxy_tier
+      - traefik.http.routers.sso.rule=Host(`${SSO_HOST}`)
+      - traefik.http.routers.sso.entrypoints=websecure
+      - traefik.http.routers.sso.tls.certresolver=letsencrypt
+      - traefik.http.services.sso.loadbalancer.server.port=4180
+      - traefik.http.middlewares.entra-auth.forwardauth.address=http://sso:4180/oauth2/auth
+      - traefik.http.middlewares.entra-auth.forwardauth.trustForwardHeader=true
+      - traefik.http.middlewares.entra-auth.forwardauth.authResponseHeaders=X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Access-Token,Authorization,Set-Cookie
+      - traefik.http.middlewares.entra-errors.errors.status=401-403
+      - traefik.http.middlewares.entra-errors.errors.service=sso@docker
+      - traefik.http.middlewares.entra-errors.errors.query=/oauth2/sign_in?rd={url}
+
+  openwork:
+    <<: *runtime_defaults
+    image: ${OPENWORK_IMAGE}
+    environment:
+      PORT: "${OPENWORK_PORT:-3000}"
+      OPENCLAW_BASE_URL: http://openclaw:${OPENCLAW_PORT:-18789}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "${OPENWORK_PORT:-3000}"
+    depends_on:
+      - openclaw
+    networks:
+      - proxy-tier
+      - app-tier
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=hybrid_proxy_tier
+      - traefik.http.routers.openwork.rule=Host(`${OPENWORK_HOST}`)
+      - traefik.http.routers.openwork.entrypoints=websecure
+      - traefik.http.routers.openwork.tls.certresolver=letsencrypt
+      - traefik.http.routers.openwork.middlewares=entra-errors@docker,entra-auth@docker,security-headers@file
+      - traefik.http.services.openwork.loadbalancer.server.port=${OPENWORK_PORT:-3000}
+
+  openclaw:
+    <<: *runtime_defaults
+    image: ${OPENCLAW_IMAGE}
+    environment:
+      MCP_N8N_URL: http://mcp-server-n8n:8000/mcp
+      NEMOCLAW_BASE_URL: http://nemoclaw:8080
+      OPENCLAW_LLM_BASE_URL: ${OPENCLAW_LLM_BASE_URL:-http://vllm:8000/v1}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+      OTEL_SERVICE_NAME: openclaw
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "${OPENCLAW_PORT:-18789}"
+    depends_on:
+      - vllm
+      - nemoclaw
+      - mcp-server-n8n
+      - qdrant
+    volumes:
+      - openclaw-data:/data
+    networks:
+      - app-tier
+      - ai-tier
+
+  nemoclaw:
+    <<: *runtime_defaults
+    image: ${NEMOCLAW_IMAGE}
+    environment:
+      OPENSHELL_SANDBOX_ROOT: /sandbox
+      OTEL_SERVICE_NAME: nemoclaw
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "8080"
+    volumes:
+      - nemoclaw-data:/sandbox
+    networks:
+      - app-tier
+      - ai-tier
+
+  vllm:
+    <<: *runtime_defaults
+    image: ${VLLM_IMAGE}
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --model
+      - ${VLLM_MODEL}
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-8192}
+    environment:
+      HF_HOME: /home/app/.cache/huggingface
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "8000"
+    shm_size: "8gb"
+    volumes:
+      - vllm-cache:/home/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+    networks:
+      - ai-tier
+
+  1password-connect-api:
+    <<: *runtime_defaults
+    image: 1password/connect-api:latest
+    environment:
+      OP_HTTP_PORT: "8080"
+      OP_LOG_LEVEL: info
+      OP_SESSION: /home/opuser/.op/1password-credentials.json
+      TZ: ${TZ:-UTC}
+    expose:
+      - "8080"
+    volumes:
+      - ${OP_CONNECT_CREDENTIALS_FILE}:/home/opuser/.op/1password-credentials.json:ro
+    networks:
+      - app-tier
+
+  1password-connect-sync:
+    <<: *runtime_defaults
+    image: 1password/connect-sync:latest
+    environment:
+      OP_HTTP_PORT: "8080"
+      OP_LOG_LEVEL: info
+      OP_SESSION: /home/opuser/.op/1password-credentials.json
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${OP_CONNECT_CREDENTIALS_FILE}:/home/opuser/.op/1password-credentials.json:ro
+    depends_on:
+      - 1password-connect-api
+    networks:
+      - app-tier
+
+  postgres:
+    <<: *runtime_defaults
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER}
+      TZ: ${TZ:-UTC}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - db-tier
+
+  n8n:
+    <<: *runtime_defaults
+    image: n8nio/n8n:latest
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_PORT: "5432"
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: ${N8N_HOST}
+      N8N_PROTOCOL: https
+      N8N_SECURE_COOKIE: "true"
+      WEBHOOK_URL: https://${N8N_HOST}/
+      TZ: ${TZ:-UTC}
+    expose:
+      - "5678"
+    depends_on:
+      - postgres
+    volumes:
+      - n8n-data:/home/node/.n8n
+    networks:
+      - proxy-tier
+      - app-tier
+      - db-tier
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=hybrid_proxy_tier
+      - traefik.http.routers.n8n.rule=Host(`${N8N_HOST}`)
+      - traefik.http.routers.n8n.entrypoints=websecure
+      - traefik.http.routers.n8n.tls.certresolver=letsencrypt
+      - traefik.http.routers.n8n.middlewares=entra-errors@docker,entra-auth@docker,security-headers@file
+      - traefik.http.services.n8n.loadbalancer.server.port=5678
+
+  mcp-server-n8n:
+    <<: *runtime_defaults
+    build:
+      context: ./mcp-servers/n8n-bridge
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      N8N_BASE_URL: http://n8n:5678
+      OP_CONNECT_URL: http://1password-connect-api:8080
+      OP_CONNECT_TOKEN: ${OP_CONNECT_TOKEN}
+      OTEL_SERVICE_NAME: mcp-server-n8n
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "8000"
+    depends_on:
+      - n8n
+      - 1password-connect-api
+    networks:
+      - app-tier
+
+  qdrant:
+    <<: *runtime_defaults
+    image: qdrant/qdrant:latest
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
+      TZ: ${TZ:-UTC}
+    expose:
+      - "6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - ai-tier
+
+volumes:
+  traefik-acme:
+  openclaw-data:
+  nemoclaw-data:
+  n8n-data:
+  postgres-data:
+  qdrant-data:
+  vllm-cache:
+
+networks:
+  proxy-tier:
+    name: hybrid_proxy_tier
+    internal: false
+  app-tier:
+    name: hybrid_app_tier
+    internal: true
+  db-tier:
+    name: hybrid_db_tier
+    internal: true
+  ai-tier:
+    name: hybrid_ai_tier
+    internal: true

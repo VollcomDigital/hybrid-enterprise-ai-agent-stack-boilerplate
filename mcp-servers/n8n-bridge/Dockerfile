@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app/src
+
+WORKDIR /app
+
+RUN useradd --create-home --uid 1000 appuser
+
+COPY pyproject.toml /app/pyproject.toml
+COPY src /app/src
+COPY tests /app/tests
+
+RUN python -m pip install --upgrade pip && \
+    python -m pip install .
+
+USER 1000:1000
+
+EXPOSE 8000
+
+CMD ["python", "-m", "n8n_bridge.server"]

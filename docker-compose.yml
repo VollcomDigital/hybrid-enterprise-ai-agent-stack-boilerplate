@@ -223,6 +223,7 @@ services:
       - "8080"
     volumes:
       - ${OP_CONNECT_CREDENTIALS_FILE}:/home/opuser/.op/1password-credentials.json:ro
+      - op-connect-data:/home/opuser/.op/data
     networks:
       - app-tier
 
@@ -236,6 +237,7 @@ services:
       TZ: ${TZ:-UTC}
     volumes:
       - ${OP_CONNECT_CREDENTIALS_FILE}:/home/opuser/.op/1password-credentials.json:ro
+      - op-connect-data:/home/opuser/.op/data
     depends_on:
       - 1password-connect-api
     networks:
@@ -359,6 +361,7 @@ services:
 
 volumes:
   traefik-acme:
+  op-connect-data:
   openclaw-data:
   nemoclaw-data:
   n8n-data:

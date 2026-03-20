@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "default_action": "deny",
+  "tools": {
+    "trigger_n8n_workflow": {
+      "allowed_webhook_ids": [
+        "replace-with-approved-webhook-id"
+      ]
+    },
+    "get_1password_secret": {
+      "allowed_vault_ids": [
+        "replace-with-approved-vault-id"
+      ],
+      "allowed_item_ids": [
+        "replace-with-approved-item-id"
+      ],
+      "allowed_field_labels": [
+        "replace-with-approved-field-label"
+      ]
+    }
+  }
+}

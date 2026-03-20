@@ -52,6 +52,7 @@ class BridgeSettings(BaseModel):
     op_connect_token: str | None = None
     bridge_access_token: str | None = None
     audit_ledger_path: str = "/tmp/n8n-bridge/audit-ledger.jsonl"
+    policy_file_path: str | None = None
     request_timeout_seconds: float = Field(default=15.0, gt=0)
     idempotency_ttl_seconds: float = Field(default=300.0, ge=0)
 
@@ -113,6 +114,7 @@ def get_settings() -> BridgeSettings:
             "BRIDGE_AUDIT_LEDGER_PATH",
             "/tmp/n8n-bridge/audit-ledger.jsonl",
         ),
+        policy_file_path=os.getenv("BRIDGE_POLICY_FILE_PATH"),
         request_timeout_seconds=float(os.getenv("BRIDGE_REQUEST_TIMEOUT_SECONDS", "15")),
         idempotency_ttl_seconds=float(os.getenv("BRIDGE_IDEMPOTENCY_TTL_SECONDS", "300")),
     )
@@ -157,6 +159,99 @@ def build_idempotency_key(webhook_id: str, payload: Mapping[str, JSONValue]) -> 
 
 def build_request_id(operation: str, identity: str) -> str:
     return hashlib.sha256(f"{operation}:{identity}".encode("utf-8")).hexdigest()[:32]
+
+
+class PolicyDeniedError(RuntimeError):
+    """Raised when a bridge policy denies tool execution."""
+
+
+class ToolPolicy(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    allowed_webhook_ids: list[str] = Field(default_factory=list)
+    allowed_vault_ids: list[str] = Field(default_factory=list)
+    allowed_item_ids: list[str] = Field(default_factory=list)
+    allowed_field_labels: list[str] = Field(default_factory=list)
+
+
+class BridgePolicy(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    version: int = 1
+    default_action: str = "allow"
+    tools: dict[str, ToolPolicy] = Field(default_factory=dict)
+
+
+class PolicyEngine:
+    def __init__(self, policy: BridgePolicy) -> None:
+        self._policy = policy
+
+    def authorize(self, tool_name: str, attributes: Mapping[str, str | None]) -> dict[str, JSONValue]:
+        tool_policy = self._policy.tools.get(tool_name)
+        default_action = self._policy.default_action.lower()
+        if tool_policy is None:
+            if default_action == "allow":
+                return {"allowed": True, "reason": "default allow policy"}
+            return {"allowed": False, "reason": f"tool '{tool_name}' is not permitted by policy"}
+
+        if tool_name == "trigger_n8n_workflow":
+            webhook_id = attributes.get("webhook_id")
+            if self._is_allowed(tool_policy.allowed_webhook_ids, webhook_id):
+                return {"allowed": True, "reason": "webhook policy matched"}
+            return {
+                "allowed": False,
+                "reason": f"workflow webhook '{webhook_id}' is not permitted by policy",
+            }
+
+        if tool_name == "get_1password_secret":
+            vault_id = attributes.get("vault_id")
+            item_id = attributes.get("item_id")
+            field_label = attributes.get("field_label")
+
+            if not self._is_allowed(tool_policy.allowed_vault_ids, vault_id):
+                return {
+                    "allowed": False,
+                    "reason": f"vault '{vault_id}' is not permitted by policy",
+                }
+            if not self._is_allowed(tool_policy.allowed_item_ids, item_id):
+                return {
+                    "allowed": False,
+                    "reason": f"item '{item_id}' is not permitted by policy",
+                }
+            if field_label is not None and not self._is_allowed(tool_policy.allowed_field_labels, field_label):
+                return {
+                    "allowed": False,
+                    "reason": f"field '{field_label}' is not permitted by policy",
+                }
+            return {"allowed": True, "reason": "secret policy matched"}
+
+        if default_action == "allow":
+            return {"allowed": True, "reason": "default allow policy"}
+        return {"allowed": False, "reason": f"tool '{tool_name}' is not permitted by policy"}
+
+    @staticmethod
+    def _is_allowed(allowed_values: list[str], candidate: str | None) -> bool:
+        if not allowed_values:
+            return True
+        if candidate is None:
+            return False
+        return "*" in allowed_values or candidate in allowed_values
+
+
+def _load_policy_file(policy_file_path: str) -> BridgePolicy:
+    payload = json.loads(Path(policy_file_path).read_text(encoding="utf-8"))
+    return BridgePolicy.model_validate(payload)
+
+
+@lru_cache(maxsize=8)
+def _cached_policy_engine(policy_file_path: str) -> PolicyEngine:
+    return PolicyEngine(_load_policy_file(policy_file_path))
+
+
+def build_policy_engine(settings: BridgeSettings) -> PolicyEngine:
+    if settings.policy_file_path:
+        return _cached_policy_engine(settings.policy_file_path)
+    return PolicyEngine(BridgePolicy(default_action="allow"))
 
 
 def build_replay_fingerprint(operation: str, request: Mapping[str, JSONValue]) -> str:
@@ -238,6 +333,52 @@ def write_audit_record(
         replay_fingerprint=replay_fingerprint,
         ledger_path=settings.audit_ledger_path,
     )
+
+
+def enforce_policy(
+    settings: BridgeSettings,
+    *,
+    tool_name: str,
+    request_id: str,
+    attributes: Mapping[str, str | None],
+) -> None:
+    policy_engine = build_policy_engine(settings)
+    with TRACER.start_as_current_span("mcp.policy_authorize") as span:
+        decision = policy_engine.authorize(tool_name, attributes)
+        allowed = bool(decision["allowed"])
+        reason = str(decision["reason"])
+        span.set_attribute("bridge.policy.tool_name", tool_name)
+        span.set_attribute("bridge.policy.allowed", allowed)
+        span.set_attribute("bridge.policy.reason", reason)
+
+        if allowed:
+            log_event(
+                "info",
+                "policy_engine.allowed",
+                tool_name=tool_name,
+                request_id=request_id,
+                reason=reason,
+            )
+            return
+
+        write_audit_record(
+            settings,
+            operation=tool_name,
+            request_id=request_id,
+            request={k: v for k, v in attributes.items()},
+            outcome={
+                "policy_decision": "deny",
+                "denial_reason": reason,
+            },
+        )
+        log_event(
+            "warning",
+            "policy_engine.denied",
+            tool_name=tool_name,
+            request_id=request_id,
+            reason=reason,
+        )
+        raise PolicyDeniedError(reason)
 
 
 def require_bridge_access_token(settings: BridgeSettings) -> str:
@@ -339,6 +480,12 @@ async def trigger_n8n_workflow_impl(
             request_id=request_id,
             webhook_url=webhook_url,
         )
+        enforce_policy(
+            settings,
+            tool_name="trigger_n8n_workflow",
+            request_id=request_id,
+            attributes={"webhook_id": request.webhook_id},
+        )
 
         cached_result = cache.get(idempotency_key)
         if cached_result is not None:
@@ -394,6 +541,7 @@ async def trigger_n8n_workflow_impl(
             outcome={
                 "status_code": response.status_code,
                 "deduplicated": False,
+                "policy_decision": "allow",
             },
             idempotency_key=idempotency_key,
         )
@@ -439,6 +587,16 @@ async def get_1password_secret_impl(
             item_id=request.item_id,
             field_label=request.field_label,
             request_id=request_id,
+        )
+        enforce_policy(
+            settings,
+            tool_name="get_1password_secret",
+            request_id=request_id,
+            attributes={
+                "vault_id": request.vault_id,
+                "item_id": request.item_id,
+                "field_label": request.field_label,
+            },
         )
 
         if not settings.op_connect_token:
@@ -504,6 +662,7 @@ async def get_1password_secret_impl(
                 outcome={
                     "available_fields": available_fields,
                     "field_label": request.field_label,
+                    "policy_decision": "allow",
                     "secret_value_redacted": True,
                 },
             )
@@ -545,6 +704,7 @@ async def get_1password_secret_impl(
             request=replay_request,
             outcome={
                 "field_label": request.field_label,
+                "policy_decision": "allow",
                 "secret_value_redacted": True,
                 "title": item.get("title"),
             },

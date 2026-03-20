@@ -19,7 +19,7 @@
 - [x] Deterministic replay and audit ledger
 - [x] Policy engine for tools, secrets, workflows
 - [x] Adaptive model routing layer
-- [ ] GPU utilization and cost governance
+- [x] GPU utilization and cost governance
 - [ ] PII-aware vector memory lifecycle
 - [ ] Progressive rollout for workflows and prompts
 - [ ] Failure-mode automation

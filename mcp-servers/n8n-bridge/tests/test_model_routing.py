@@ -207,3 +207,113 @@ def test_model_router_raises_when_no_route_matches(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="No healthy model route matched"):
         router.select_route(request)
+
+
+def test_model_router_skips_gpu_route_when_utilization_exceeds_threshold(tmp_path: Path) -> None:
+    settings = BridgeSettings(
+        routing_file_path=write_routing_config(
+            tmp_path / "routing.json",
+            {
+                "version": 1,
+                "default_route": "remote_secure",
+                "routes": {
+                    "local_vllm": {
+                        "base_url": "http://vllm:8000/v1",
+                        "model": "Qwen/Qwen2.5-Coder-7B-Instruct",
+                        "provider": "vllm",
+                        "capabilities": ["code"],
+                        "allowed_data_classifications": ["public", "internal"],
+                        "regions": ["local"],
+                        "max_latency_ms": 600,
+                        "priority": 10,
+                        "requires_local": True,
+                        "healthy": True,
+                        "current_gpu_utilization_percent": 96,
+                        "max_gpu_utilization_percent": 85
+                    },
+                    "remote_secure": {
+                        "base_url": "https://secure-llm.example.com/v1",
+                        "model": "gpt-secure",
+                        "provider": "remote",
+                        "capabilities": ["code"],
+                        "allowed_data_classifications": ["public", "internal", "restricted"],
+                        "regions": ["*"],
+                        "max_latency_ms": 3500,
+                        "priority": 50,
+                        "requires_local": False,
+                        "healthy": True
+                    }
+                }
+            },
+        )
+    )
+    router = build_model_router(settings)
+    request = ModelRoutingRequest(
+        workload_kind="code",
+        data_classification="internal",
+        max_latency_ms=4000,
+        require_local=False,
+        preferred_region="local",
+    )
+
+    result = router.select_route(request)
+
+    assert result["route_name"] == "remote_secure"
+    assert result["fallback"] is True
+
+
+def test_model_router_skips_route_when_projected_cost_exceeds_budget(tmp_path: Path) -> None:
+    settings = BridgeSettings(
+        routing_file_path=write_routing_config(
+            tmp_path / "routing.json",
+            {
+                "version": 1,
+                "default_route": "budget_route",
+                "routes": {
+                    "budget_route": {
+                        "base_url": "https://cheap-llm.example.com/v1",
+                        "model": "cheap-model",
+                        "provider": "remote",
+                        "capabilities": ["chat"],
+                        "allowed_data_classifications": ["public"],
+                        "regions": ["*"],
+                        "max_latency_ms": 2500,
+                        "priority": 10,
+                        "requires_local": False,
+                        "healthy": True,
+                        "estimated_cost_per_1k_tokens_usd": 0.20,
+                        "daily_budget_usd": 10.0,
+                        "current_spend_usd": 9.95
+                    },
+                    "fallback_route": {
+                        "base_url": "https://fallback-llm.example.com/v1",
+                        "model": "fallback-model",
+                        "provider": "remote",
+                        "capabilities": ["chat"],
+                        "allowed_data_classifications": ["public"],
+                        "regions": ["*"],
+                        "max_latency_ms": 3500,
+                        "priority": 50,
+                        "requires_local": False,
+                        "healthy": True,
+                        "estimated_cost_per_1k_tokens_usd": 0.02
+                    }
+                }
+            },
+        )
+    )
+    router = build_model_router(settings)
+    request = ModelRoutingRequest(
+        workload_kind="chat",
+        data_classification="public",
+        max_latency_ms=4000,
+        require_local=False,
+        preferred_region="eu-central",
+        estimated_total_tokens=500,
+        max_cost_usd=0.10,
+    )
+
+    result = router.select_route(request)
+
+    assert result["route_name"] == "fallback_route"
+    assert result["projected_cost_usd"] == pytest.approx(0.01)

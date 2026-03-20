@@ -84,6 +84,8 @@ class ModelRoutingRequest(BaseModel):
     workload_kind: str = Field(min_length=1)
     data_classification: str = Field(min_length=1)
     max_latency_ms: int = Field(ge=1)
+    estimated_total_tokens: int = Field(default=0, ge=0)
+    max_cost_usd: float | None = Field(default=None, ge=0)
     require_local: bool = False
     preferred_region: str | None = None
 
@@ -101,6 +103,13 @@ class ModelRouteConfig(BaseModel):
     priority: int = Field(default=100, ge=0)
     requires_local: bool = False
     healthy: bool = True
+    current_gpu_utilization_percent: int = Field(default=0, ge=0, le=100)
+    max_gpu_utilization_percent: int = Field(default=100, ge=0, le=100)
+    current_concurrent_requests: int = Field(default=0, ge=0)
+    max_concurrent_requests: int | None = Field(default=None, ge=1)
+    estimated_cost_per_1k_tokens_usd: float = Field(default=0.0, ge=0)
+    daily_budget_usd: float | None = Field(default=None, ge=0)
+    current_spend_usd: float = Field(default=0.0, ge=0)
 
 
 class ModelRoutingConfig(BaseModel):
@@ -295,6 +304,7 @@ class ModelRouter:
         matching_routes = [
             (route_name, route)
             for route_name, route in self._config.routes.items()
+            if route_name != self._config.default_route
             if self._route_matches(route, request)
         ]
         if matching_routes:
@@ -317,8 +327,32 @@ class ModelRouter:
         raise RuntimeError("No healthy model route matched the request.")
 
     @staticmethod
-    def _route_matches(route: ModelRouteConfig, request: ModelRoutingRequest) -> bool:
+    def _projected_cost_usd(route: ModelRouteConfig, request: ModelRoutingRequest) -> float:
+        if request.estimated_total_tokens <= 0 or route.estimated_cost_per_1k_tokens_usd <= 0:
+            return 0.0
+        return (request.estimated_total_tokens / 1000.0) * route.estimated_cost_per_1k_tokens_usd
+
+    @classmethod
+    def _governance_matches(cls, route: ModelRouteConfig, request: ModelRoutingRequest) -> bool:
+        if route.current_gpu_utilization_percent > route.max_gpu_utilization_percent:
+            return False
+        if (
+            route.max_concurrent_requests is not None
+            and route.current_concurrent_requests >= route.max_concurrent_requests
+        ):
+            return False
+        projected_cost_usd = cls._projected_cost_usd(route, request)
+        if request.max_cost_usd is not None and projected_cost_usd > request.max_cost_usd:
+            return False
+        if route.daily_budget_usd is not None and (route.current_spend_usd + projected_cost_usd) > route.daily_budget_usd:
+            return False
+        return True
+
+    @classmethod
+    def _route_matches(cls, route: ModelRouteConfig, request: ModelRoutingRequest) -> bool:
         if not route.healthy:
+            return False
+        if not cls._governance_matches(route, request):
             return False
         if route.max_latency_ms > request.max_latency_ms:
             return False
@@ -337,9 +371,11 @@ class ModelRouter:
                 return False
         return True
 
-    @staticmethod
-    def _fallback_matches(route: ModelRouteConfig, request: ModelRoutingRequest) -> bool:
+    @classmethod
+    def _fallback_matches(cls, route: ModelRouteConfig, request: ModelRoutingRequest) -> bool:
         if not route.healthy:
+            return False
+        if not cls._governance_matches(route, request):
             return False
         if request.require_local and not route.requires_local:
             return False
@@ -361,6 +397,7 @@ class ModelRouter:
         *,
         fallback: bool = False,
     ) -> dict[str, JSONValue]:
+        projected_cost_usd = ModelRouter._projected_cost_usd(route, request)
         return {
             "route_name": route_name,
             "provider": route.provider,
@@ -369,6 +406,11 @@ class ModelRouter:
             "requires_local": route.requires_local,
             "max_latency_ms": route.max_latency_ms,
             "priority": route.priority,
+            "current_gpu_utilization_percent": route.current_gpu_utilization_percent,
+            "max_gpu_utilization_percent": route.max_gpu_utilization_percent,
+            "current_concurrent_requests": route.current_concurrent_requests,
+            "max_concurrent_requests": route.max_concurrent_requests,
+            "projected_cost_usd": projected_cost_usd,
             "fallback": fallback,
             "replay_fingerprint": build_replay_fingerprint(
                 "select_model_route",

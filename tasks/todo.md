@@ -22,7 +22,7 @@
 - [x] GPU utilization and cost governance
 - [x] PII-aware vector memory lifecycle
 - [x] Progressive rollout for workflows and prompts
-- [ ] Failure-mode automation
+- [x] Failure-mode automation
 
 ## Phase 4: The 1% Visionary Roadmap
 - [ ] Full confidential-agent architecture

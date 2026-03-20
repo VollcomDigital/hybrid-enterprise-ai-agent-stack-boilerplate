@@ -32,3 +32,21 @@
   Container tags alone are insufficient without provenance, SBOM, and a release
   manifest artifact.
 
+## Phase 3
+
+- Advanced governance features land more safely when expressed as declarative
+  policy/config files mounted into a small, auditable control-plane service
+  rather than scattered across application code.
+- Replayability becomes much more valuable once policy, routing, rollout, and
+  lifecycle decisions all emit deterministic fingerprints and audit records in a
+  shared ledger format.
+- Adaptive routing must treat fallback routes differently from primary
+  candidates; otherwise governance and canary semantics collapse into ordinary
+  priority sorting.
+- Privacy lifecycle controls should be designed alongside legal-hold and
+  deletion-request paths from the beginning. Retention logic alone is not enough
+  for compliance-grade systems.
+- Failure automation is safest when it plans deterministic reactions (`retry`,
+  `failover`, `degrade`, `halt`) first. Execution of those actions can then be
+  delegated later to a more privileged orchestrator.
+

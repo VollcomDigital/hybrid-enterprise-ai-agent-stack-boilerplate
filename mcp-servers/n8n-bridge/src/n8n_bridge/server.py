@@ -56,6 +56,7 @@ class BridgeSettings(BaseModel):
     routing_file_path: str | None = None
     vector_memory_policy_file_path: str | None = None
     rollout_file_path: str | None = None
+    failure_mode_file_path: str | None = None
     request_timeout_seconds: float = Field(default=15.0, gt=0)
     idempotency_ttl_seconds: float = Field(default=300.0, ge=0)
 
@@ -180,6 +181,33 @@ class ProgressiveRolloutConfig(BaseModel):
     prompts: dict[str, ProgressiveRolloutEntry] = Field(default_factory=dict)
 
 
+class FailureModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    component_name: str = Field(min_length=1)
+    failure_type: str = Field(min_length=1)
+    severity: str = Field(min_length=1)
+    retry_count: int = Field(default=0, ge=0)
+    data_classification: str = Field(min_length=1)
+
+
+class FailureModeRule(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    action: str
+    max_retries: int = Field(default=0, ge=0)
+    backoff_seconds: list[int] = Field(default_factory=list)
+    fallback_target: str | None = None
+
+
+class FailureModeConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    version: int = 1
+    default_action: str = "degrade"
+    rules: dict[str, FailureModeRule] = Field(default_factory=dict)
+
+
 class IdempotencyCache:
     def __init__(self, ttl_seconds: float) -> None:
         self._ttl_seconds = ttl_seconds
@@ -221,6 +249,7 @@ def get_settings() -> BridgeSettings:
         routing_file_path=os.getenv("BRIDGE_ROUTING_FILE_PATH"),
         vector_memory_policy_file_path=os.getenv("BRIDGE_VECTOR_MEMORY_POLICY_FILE_PATH"),
         rollout_file_path=os.getenv("BRIDGE_ROLLOUT_FILE_PATH"),
+        failure_mode_file_path=os.getenv("BRIDGE_FAILURE_MODE_FILE_PATH"),
         request_timeout_seconds=float(os.getenv("BRIDGE_REQUEST_TIMEOUT_SECONDS", "15")),
         idempotency_ttl_seconds=float(os.getenv("BRIDGE_IDEMPOTENCY_TTL_SECONDS", "300")),
     )
@@ -699,6 +728,53 @@ def build_progressive_rollout_engine(settings: BridgeSettings) -> ProgressiveRol
     if settings.rollout_file_path:
         return _cached_progressive_rollout_engine(settings.rollout_file_path)
     return ProgressiveRolloutEngine(ProgressiveRolloutConfig())
+
+
+class FailureModeEngine:
+    def __init__(self, config: FailureModeConfig) -> None:
+        self._config = config
+
+    def plan(self, request: FailureModeRequest) -> dict[str, JSONValue]:
+        rule_key = f"{request.component_name}:{request.failure_type}"
+        rule = self._config.rules.get(rule_key, FailureModeRule(action=self._config.default_action))
+        retry_allowed = request.retry_count < rule.max_retries
+        action = rule.action
+        if action == "retry" and not retry_allowed:
+            action = "degrade"
+
+        next_backoff_seconds = None
+        if action == "retry" and retry_allowed and rule.backoff_seconds:
+            next_backoff_seconds = rule.backoff_seconds[min(request.retry_count, len(rule.backoff_seconds) - 1)]
+
+        return {
+            "component_name": request.component_name,
+            "failure_type": request.failure_type,
+            "severity": request.severity,
+            "action": action,
+            "retry_allowed": retry_allowed,
+            "next_backoff_seconds": next_backoff_seconds,
+            "fallback_target": rule.fallback_target,
+            "replay_fingerprint": build_replay_fingerprint(
+                "plan_failure_mode",
+                request.model_dump(mode="json"),
+            ),
+        }
+
+
+def _load_failure_mode_file(failure_mode_file_path: str) -> FailureModeConfig:
+    payload = json.loads(Path(failure_mode_file_path).read_text(encoding="utf-8"))
+    return FailureModeConfig.model_validate(payload)
+
+
+@lru_cache(maxsize=8)
+def _cached_failure_mode_engine(failure_mode_file_path: str) -> FailureModeEngine:
+    return FailureModeEngine(_load_failure_mode_file(failure_mode_file_path))
+
+
+def build_failure_mode_engine(settings: BridgeSettings) -> FailureModeEngine:
+    if settings.failure_mode_file_path:
+        return _cached_failure_mode_engine(settings.failure_mode_file_path)
+    return FailureModeEngine(FailureModeConfig())
 
 
 def build_replay_fingerprint(operation: str, request: Mapping[str, JSONValue]) -> str:
@@ -1338,6 +1414,65 @@ async def plan_progressive_rollout_impl(
         return rollout_result
 
 
+async def plan_failure_mode_impl(
+    request: FailureModeRequest,
+    settings: BridgeSettings,
+) -> dict[str, JSONValue]:
+    request_id = build_request_id(
+        "plan_failure_mode",
+        canonicalize_payload(request.model_dump(mode="json")),
+    )
+
+    with TRACER.start_as_current_span("mcp.plan_failure_mode") as span:
+        span.set_attribute("bridge.request_id", request_id)
+        span.set_attribute("bridge.failure.component_name", request.component_name)
+        span.set_attribute("bridge.failure.failure_type", request.failure_type)
+        log_event(
+            "info",
+            "plan_failure_mode.start",
+            request_id=request_id,
+            component_name=request.component_name,
+            failure_type=request.failure_type,
+            severity=request.severity,
+            retry_count=request.retry_count,
+        )
+        enforce_policy(
+            settings,
+            tool_name="plan_failure_mode",
+            request_id=request_id,
+            attributes={
+                "component_name": request.component_name,
+                "failure_type": request.failure_type,
+            },
+        )
+
+        failure_result = build_failure_mode_engine(settings).plan(request)
+        failure_result["request_id"] = request_id
+        write_audit_record(
+            settings,
+            operation="plan_failure_mode",
+            request_id=request_id,
+            request=request.model_dump(mode="json"),
+            outcome={
+                "action": failure_result["action"],
+                "retry_allowed": failure_result["retry_allowed"],
+                "fallback_target": failure_result["fallback_target"],
+                "policy_decision": "allow",
+            },
+        )
+        log_event(
+            "info",
+            "plan_failure_mode.completed",
+            request_id=request_id,
+            component_name=request.component_name,
+            failure_type=request.failure_type,
+            action=failure_result["action"],
+            retry_allowed=failure_result["retry_allowed"],
+            fallback_target=failure_result["fallback_target"],
+        )
+        return failure_result
+
+
 DEFAULT_CACHE = IdempotencyCache(ttl_seconds=get_settings().idempotency_ttl_seconds)
 
 
@@ -1425,6 +1560,26 @@ async def plan_progressive_rollout(
         subject_id=subject_id,
     )
     return await plan_progressive_rollout_impl(request, settings)
+
+
+@MCP_SERVER.tool()
+async def plan_failure_mode(
+    component_name: str,
+    failure_type: str,
+    severity: str,
+    retry_count: int,
+    data_classification: str,
+) -> dict[str, JSONValue]:
+    """Plan deterministic retry, failover, degrade, or halt actions for known failure modes."""
+    settings = get_settings()
+    request = FailureModeRequest(
+        component_name=component_name,
+        failure_type=failure_type,
+        severity=severity,
+        retry_count=retry_count,
+        data_classification=data_classification,
+    )
+    return await plan_failure_mode_impl(request, settings)
 
 
 def main() -> None:

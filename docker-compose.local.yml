@@ -274,6 +274,7 @@ services:
       BRIDGE_POLICY_FILE_PATH: ${BRIDGE_POLICY_FILE_PATH:-/etc/n8n-bridge/policy.json}
       BRIDGE_ROUTING_FILE_PATH: ${BRIDGE_ROUTING_FILE_PATH:-/etc/n8n-bridge/model-routing.json}
       BRIDGE_VECTOR_MEMORY_POLICY_FILE_PATH: ${BRIDGE_VECTOR_MEMORY_POLICY_FILE_PATH:-/etc/n8n-bridge/vector-memory-policy.json}
+      BRIDGE_ROLLOUT_FILE_PATH: ${BRIDGE_ROLLOUT_FILE_PATH:-/etc/n8n-bridge/rollout.json}
       MCP_HOST: 0.0.0.0
       MCP_PORT: "8000"
       N8N_BASE_URL: http://n8n:5678
@@ -293,6 +294,7 @@ services:
       - ./infrastructure/policy/mcp-policy.local.json:/etc/n8n-bridge/policy.json:ro
       - ./infrastructure/policy/model-routing.local.json:/etc/n8n-bridge/model-routing.json:ro
       - ./infrastructure/policy/vector-memory.local.json:/etc/n8n-bridge/vector-memory-policy.json:ro
+      - ./infrastructure/policy/rollout.local.json:/etc/n8n-bridge/rollout.json:ro
     depends_on:
       - n8n
       - 1password-connect-api

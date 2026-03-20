@@ -55,6 +55,7 @@ class BridgeSettings(BaseModel):
     policy_file_path: str | None = None
     routing_file_path: str | None = None
     vector_memory_policy_file_path: str | None = None
+    rollout_file_path: str | None = None
     request_timeout_seconds: float = Field(default=15.0, gt=0)
     idempotency_ttl_seconds: float = Field(default=300.0, ge=0)
 
@@ -151,6 +152,34 @@ class VectorMemoryPolicyConfig(BaseModel):
     pii_overrides: dict[str, VectorMemoryRule] = Field(default_factory=dict)
 
 
+class ProgressiveRolloutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rollout_kind: str = Field(min_length=1)
+    rollout_key: str = Field(min_length=1)
+    subject_id: str = Field(min_length=1)
+
+
+class ProgressiveRolloutEntry(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    mode: str
+    primary_webhook_id: str | None = None
+    shadow_webhook_id: str | None = None
+    canary_webhook_id: str | None = None
+    active_prompt_version: str | None = None
+    canary_prompt_version: str | None = None
+    canary_percentage: int = Field(default=0, ge=0, le=100)
+
+
+class ProgressiveRolloutConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    version: int = 1
+    workflows: dict[str, ProgressiveRolloutEntry] = Field(default_factory=dict)
+    prompts: dict[str, ProgressiveRolloutEntry] = Field(default_factory=dict)
+
+
 class IdempotencyCache:
     def __init__(self, ttl_seconds: float) -> None:
         self._ttl_seconds = ttl_seconds
@@ -191,6 +220,7 @@ def get_settings() -> BridgeSettings:
         policy_file_path=os.getenv("BRIDGE_POLICY_FILE_PATH"),
         routing_file_path=os.getenv("BRIDGE_ROUTING_FILE_PATH"),
         vector_memory_policy_file_path=os.getenv("BRIDGE_VECTOR_MEMORY_POLICY_FILE_PATH"),
+        rollout_file_path=os.getenv("BRIDGE_ROLLOUT_FILE_PATH"),
         request_timeout_seconds=float(os.getenv("BRIDGE_REQUEST_TIMEOUT_SECONDS", "15")),
         idempotency_ttl_seconds=float(os.getenv("BRIDGE_IDEMPOTENCY_TTL_SECONDS", "300")),
     )
@@ -572,6 +602,103 @@ def build_vector_memory_lifecycle_engine(settings: BridgeSettings) -> VectorMemo
     if settings.vector_memory_policy_file_path:
         return _cached_vector_memory_lifecycle_engine(settings.vector_memory_policy_file_path)
     return VectorMemoryLifecycleEngine(VectorMemoryPolicyConfig())
+
+
+class ProgressiveRolloutEngine:
+    def __init__(self, config: ProgressiveRolloutConfig) -> None:
+        self._config = config
+
+    def plan(self, request: ProgressiveRolloutRequest) -> dict[str, JSONValue]:
+        entry = self._resolve_entry(request)
+        bucket = self._subject_bucket(request.subject_id, request.rollout_key)
+        mode = entry.mode.lower()
+
+        if mode == "shadow":
+            target = entry.primary_webhook_id or entry.active_prompt_version
+            shadow_target = entry.shadow_webhook_id or entry.canary_prompt_version
+            return self._serialize_result(
+                request=request,
+                mode=mode,
+                bucket=bucket,
+                target=target,
+                shadow_target=shadow_target,
+            )
+
+        if mode == "canary":
+            is_canary = bucket < entry.canary_percentage
+            if request.rollout_kind == "workflow":
+                target = entry.canary_webhook_id if is_canary else entry.primary_webhook_id
+            else:
+                target = entry.canary_prompt_version if is_canary else entry.active_prompt_version
+            return self._serialize_result(
+                request=request,
+                mode=mode,
+                bucket=bucket,
+                target=target,
+                shadow_target=None,
+            )
+
+        if mode == "full":
+            target = entry.primary_webhook_id if request.rollout_kind == "workflow" else entry.active_prompt_version
+            return self._serialize_result(
+                request=request,
+                mode=mode,
+                bucket=bucket,
+                target=target,
+                shadow_target=None,
+            )
+
+        raise RuntimeError(f"Unsupported rollout mode '{entry.mode}' for '{request.rollout_key}'.")
+
+    def _resolve_entry(self, request: ProgressiveRolloutRequest) -> ProgressiveRolloutEntry:
+        registry = self._config.workflows if request.rollout_kind == "workflow" else self._config.prompts
+        entry = registry.get(request.rollout_key)
+        if entry is None:
+            raise RuntimeError(f"Unknown rollout key '{request.rollout_key}' for kind '{request.rollout_kind}'.")
+        return entry
+
+    @staticmethod
+    def _subject_bucket(subject_id: str, rollout_key: str) -> int:
+        digest = hashlib.sha256(f"{rollout_key}:{subject_id}".encode("utf-8")).hexdigest()
+        return int(digest[:8], 16) % 100
+
+    @staticmethod
+    def _serialize_result(
+        *,
+        request: ProgressiveRolloutRequest,
+        mode: str,
+        bucket: int,
+        target: str | None,
+        shadow_target: str | None,
+    ) -> dict[str, JSONValue]:
+        return {
+            "rollout_kind": request.rollout_kind,
+            "rollout_key": request.rollout_key,
+            "mode": mode,
+            "bucket": bucket,
+            "target": target,
+            "shadow_target": shadow_target,
+            "replay_fingerprint": build_replay_fingerprint(
+                "plan_progressive_rollout",
+                request.model_dump(mode="json"),
+            ),
+        }
+
+
+def _load_rollout_file(rollout_file_path: str) -> ProgressiveRolloutConfig:
+    payload = json.loads(Path(rollout_file_path).read_text(encoding="utf-8"))
+    return ProgressiveRolloutConfig.model_validate(payload)
+
+
+@lru_cache(maxsize=8)
+def _cached_progressive_rollout_engine(rollout_file_path: str) -> ProgressiveRolloutEngine:
+    return ProgressiveRolloutEngine(_load_rollout_file(rollout_file_path))
+
+
+def build_progressive_rollout_engine(settings: BridgeSettings) -> ProgressiveRolloutEngine:
+    if settings.rollout_file_path:
+        return _cached_progressive_rollout_engine(settings.rollout_file_path)
+    return ProgressiveRolloutEngine(ProgressiveRolloutConfig())
 
 
 def build_replay_fingerprint(operation: str, request: Mapping[str, JSONValue]) -> str:
@@ -1153,6 +1280,64 @@ async def plan_vector_memory_lifecycle_impl(
         return lifecycle_result
 
 
+async def plan_progressive_rollout_impl(
+    request: ProgressiveRolloutRequest,
+    settings: BridgeSettings,
+) -> dict[str, JSONValue]:
+    request_id = build_request_id(
+        "plan_progressive_rollout",
+        canonicalize_payload(request.model_dump(mode="json")),
+    )
+
+    with TRACER.start_as_current_span("mcp.plan_progressive_rollout") as span:
+        span.set_attribute("bridge.request_id", request_id)
+        span.set_attribute("bridge.rollout.kind", request.rollout_kind)
+        span.set_attribute("bridge.rollout.key", request.rollout_key)
+        log_event(
+            "info",
+            "plan_progressive_rollout.start",
+            request_id=request_id,
+            rollout_kind=request.rollout_kind,
+            rollout_key=request.rollout_key,
+            subject_id=request.subject_id,
+        )
+        enforce_policy(
+            settings,
+            tool_name="plan_progressive_rollout",
+            request_id=request_id,
+            attributes={
+                "rollout_kind": request.rollout_kind,
+                "rollout_key": request.rollout_key,
+            },
+        )
+
+        rollout_result = build_progressive_rollout_engine(settings).plan(request)
+        rollout_result["request_id"] = request_id
+        write_audit_record(
+            settings,
+            operation="plan_progressive_rollout",
+            request_id=request_id,
+            request=request.model_dump(mode="json"),
+            outcome={
+                "mode": rollout_result["mode"],
+                "target": rollout_result["target"],
+                "shadow_target": rollout_result["shadow_target"],
+                "policy_decision": "allow",
+            },
+        )
+        log_event(
+            "info",
+            "plan_progressive_rollout.completed",
+            request_id=request_id,
+            rollout_kind=request.rollout_kind,
+            rollout_key=request.rollout_key,
+            mode=rollout_result["mode"],
+            target=rollout_result["target"],
+            shadow_target=rollout_result["shadow_target"],
+        )
+        return rollout_result
+
+
 DEFAULT_CACHE = IdempotencyCache(ttl_seconds=get_settings().idempotency_ttl_seconds)
 
 
@@ -1224,6 +1409,22 @@ async def plan_vector_memory_lifecycle(
         deletion_requested=deletion_requested,
     )
     return await plan_vector_memory_lifecycle_impl(request, settings)
+
+
+@MCP_SERVER.tool()
+async def plan_progressive_rollout(
+    rollout_kind: str,
+    rollout_key: str,
+    subject_id: str,
+) -> dict[str, JSONValue]:
+    """Plan a deterministic rollout decision for workflows or prompt versions."""
+    settings = get_settings()
+    request = ProgressiveRolloutRequest(
+        rollout_kind=rollout_kind,
+        rollout_key=rollout_key,
+        subject_id=subject_id,
+    )
+    return await plan_progressive_rollout_impl(request, settings)
 
 
 def main() -> None:

@@ -143,6 +143,11 @@ class VectorMemoryLifecycleRequest(BaseModel):
     legal_hold: bool = False
     deletion_requested: bool = False
 
+    @field_validator("pii_labels")
+    @classmethod
+    def normalize_pii_labels(cls, value: list[str]) -> list[str]:
+        return sorted(dict.fromkeys(value))
+
 
 class VectorMemoryRule(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -281,6 +286,11 @@ class AgentControlPlaneRequest(BaseModel):
     requested_capabilities: list[str] = Field(default_factory=list)
     requested_policy_pack: str | None = None
     requested_quota_class: str | None = None
+
+    @field_validator("requested_capabilities")
+    @classmethod
+    def normalize_requested_capabilities(cls, value: list[str]) -> list[str]:
+        return sorted(dict.fromkeys(value))
 
 
 class ComplianceCaseRequest(BaseModel):

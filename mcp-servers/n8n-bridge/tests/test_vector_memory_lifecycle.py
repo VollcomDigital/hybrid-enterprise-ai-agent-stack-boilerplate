@@ -66,6 +66,30 @@ def test_vector_memory_lifecycle_replay_fingerprint_is_deterministic(tmp_path: P
     assert build_vector_memory_lifecycle_engine(settings)
 
 
+def test_vector_memory_lifecycle_replay_fingerprint_ignores_pii_label_order(tmp_path: Path) -> None:
+    write_vector_policy(
+        tmp_path / "vector-policy.json",
+        default_policy_payload(),
+    )
+    a = VectorMemoryLifecycleRequest(
+        memory_id="mem-001",
+        subject_id="user-123",
+        data_classification="internal",
+        pii_labels=["email", "phone"],
+        created_at="2026-03-01T00:00:00+00:00",
+    )
+    b = VectorMemoryLifecycleRequest(
+        memory_id="mem-001",
+        subject_id="user-123",
+        data_classification="internal",
+        pii_labels=["phone", "email"],
+        created_at="2026-03-01T00:00:00+00:00",
+    )
+    assert build_replay_fingerprint(
+        "plan_vector_memory_lifecycle", a.model_dump(mode="json")
+    ) == build_replay_fingerprint("plan_vector_memory_lifecycle", b.model_dump(mode="json"))
+
+
 @pytest.mark.asyncio
 async def test_vector_memory_lifecycle_respects_legal_hold_over_delete_request(tmp_path: Path) -> None:
     settings = BridgeSettings(

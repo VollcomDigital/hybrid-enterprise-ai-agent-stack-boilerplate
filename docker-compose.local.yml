@@ -252,6 +252,7 @@ services:
       TZ: ${TZ:-UTC}
     volumes:
       - ${OP_CONNECT_CREDENTIALS_FILE}:/home/opuser/.op/1password-credentials.json:ro
+      - op-connect-data:/home/opuser/.op/data
     depends_on:
       - 1password-connect-api
     networks:

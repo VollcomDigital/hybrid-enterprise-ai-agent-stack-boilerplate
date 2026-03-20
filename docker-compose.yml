@@ -37,6 +37,7 @@ services:
 
   traefik:
     <<: *runtime_defaults
+    user: "0:0"
     image: traefik:v3.3
     command:
       - --configFile=/etc/traefik/traefik.yml

@@ -144,6 +144,30 @@ def test_agent_control_plane_replay_fingerprint_is_deterministic(tmp_path: Path)
     )
 
 
+def test_agent_control_plane_replay_fingerprint_ignores_requested_capability_order(
+    tmp_path: Path,
+) -> None:
+    write_control_plane_config(
+        tmp_path / "agent-control.json",
+        base_control_plane_config(),
+    )
+    a = AgentControlPlaneRequest(
+        tenant_id="tenant-b",
+        agent_id="agent-004",
+        requested_capabilities=["workflow-admin", "chat"],
+        requested_quota_class="elevated",
+    )
+    b = AgentControlPlaneRequest(
+        tenant_id="tenant-b",
+        agent_id="agent-004",
+        requested_capabilities=["chat", "workflow-admin"],
+        requested_quota_class="elevated",
+    )
+    assert build_replay_fingerprint(
+        "plan_agent_control_plane", a.model_dump(mode="json")
+    ) == build_replay_fingerprint("plan_agent_control_plane", b.model_dump(mode="json"))
+
+
 @pytest.mark.asyncio
 async def test_agent_control_plane_plan_returns_request_id(tmp_path: Path) -> None:
     settings = BridgeSettings(

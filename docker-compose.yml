@@ -179,7 +179,7 @@ services:
 
   1password-connect-api:
     <<: *runtime_defaults
-    image: 1password/connect-api:latest
+    image: ${OP_CONNECT_API_IMAGE:?OP_CONNECT_API_IMAGE must be set to an immutable image reference}
     environment:
       OP_HTTP_PORT: "8080"
       OP_LOG_LEVEL: info
@@ -194,7 +194,7 @@ services:
 
   1password-connect-sync:
     <<: *runtime_defaults
-    image: 1password/connect-sync:latest
+    image: ${OP_CONNECT_SYNC_IMAGE:?OP_CONNECT_SYNC_IMAGE must be set to an immutable image reference}
     environment:
       OP_HTTP_PORT: "8080"
       OP_LOG_LEVEL: info
@@ -223,7 +223,7 @@ services:
 
   n8n:
     <<: *runtime_defaults
-    image: n8nio/n8n:latest
+    image: ${N8N_IMAGE:?N8N_IMAGE must be set to an immutable image reference}
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
@@ -280,7 +280,7 @@ services:
 
   qdrant:
     <<: *runtime_defaults
-    image: qdrant/qdrant:latest
+    image: ${QDRANT_IMAGE:?QDRANT_IMAGE must be set to an immutable image reference}
     environment:
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
       TZ: ${TZ:-UTC}

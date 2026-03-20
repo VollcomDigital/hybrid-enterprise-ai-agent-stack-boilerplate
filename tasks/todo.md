@@ -4,7 +4,7 @@
 - [x] Define one canonical platform narrative
 - [x] Close the MCP trust gap
 - [x] Make Entra policy mandatory in prod
-- [ ] Eliminate floating production artifacts
+- [x] Eliminate floating production artifacts
 - [ ] Add CI baseline immediately
 - [ ] Fix repo truthfulness
 

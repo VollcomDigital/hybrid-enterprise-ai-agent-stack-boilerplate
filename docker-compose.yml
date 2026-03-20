@@ -3,6 +3,7 @@ name: hybrid-ai-agent-stack
 x-runtime-defaults: &runtime_defaults
   restart: unless-stopped
   user: "${APP_UID:-1000}:${APP_GID:-1000}"
+  pids_limit: 256
   cap_drop:
     - ALL
   security_opt:

@@ -3,6 +3,7 @@ name: hybrid-ai-agent-stack-local
 x-local-runtime: &local_runtime
   restart: unless-stopped
   user: "${APP_UID:-1000}:${APP_GID:-1000}"
+  pids_limit: 256
   cap_drop:
     - ALL
   security_opt:

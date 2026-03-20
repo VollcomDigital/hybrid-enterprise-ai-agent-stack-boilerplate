@@ -168,3 +168,10 @@ kubectl apply -k k8s/apps/zeroclaw-assistant/
 - The `backend/openclaw`, `backend/nemoclaw`, and `frontend/openwork`
   directories are currently mount points/placeholders rather than full
   in-repo upstream application sources.
+
+---
+
+## License
+
+This repository is currently **UNLICENSED** unless and until the owner publishes
+an explicit license grant in `LICENSE`.

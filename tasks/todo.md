@@ -6,7 +6,7 @@
 - [x] Make Entra policy mandatory in prod
 - [x] Eliminate floating production artifacts
 - [x] Add CI baseline immediately
-- [ ] Fix repo truthfulness
+- [x] Fix repo truthfulness
 
 ## Phase 2: Reaching Industry Standard (30 Days)
 - [ ] Add reproducible dependency management

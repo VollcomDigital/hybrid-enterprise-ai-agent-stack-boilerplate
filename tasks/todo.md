@@ -5,7 +5,7 @@
 - [x] Close the MCP trust gap
 - [x] Make Entra policy mandatory in prod
 - [x] Eliminate floating production artifacts
-- [ ] Add CI baseline immediately
+- [x] Add CI baseline immediately
 - [ ] Fix repo truthfulness
 
 ## Phase 2: Reaching Industry Standard (30 Days)

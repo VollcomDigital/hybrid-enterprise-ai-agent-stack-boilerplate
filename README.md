@@ -1,4 +1,4 @@
-# hybrid-enterprise-ai-agent-stack
+# Hybrid Enterprise AI Agent Stack Boilerplate
 
 Monorepo scaffold for a **hybrid enterprise AI agent platform** that supports:
 

@@ -28,8 +28,12 @@ def test_ci_baseline_workflows_exist_and_cover_validation_security_and_updates()
     assert "trivy" in security_content.lower()
     assert "upload-sarif" in security_content
 
-    assert "github/codeql-action/init" in codeql_content
+    assert "github/codeql-action/init@v3" in codeql_content
+    assert "github/codeql-action/autobuild@v3" in codeql_content
+    assert "github/codeql-action/analyze@v3" in codeql_content
+    assert "github/codeql-action/analyze@v4" not in codeql_content
     assert "languages: python" in codeql_content
+    assert "languages: javascript" not in codeql_content
 
     assert 'package-ecosystem: "github-actions"' in dependabot_content
     assert 'package-ecosystem: "pip"' in dependabot_content

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -9,15 +10,17 @@ import threading
 import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from functools import lru_cache
 from pathlib import Path
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider as SDKTracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SpanExporter
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -40,7 +43,21 @@ LOGGER.setLevel(logging.INFO)
 LOGGER.propagate = False
 
 SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "mcp-server-n8n")
-TRACER = trace.get_tracer(SERVICE_NAME)
+
+
+class _LazyTracer:
+    """Resolves the tracer on each use so spans see the provider set after configure_telemetry() in main()."""
+
+    __slots__ = ("_service_name",)
+
+    def __init__(self, service_name: str) -> None:
+        self._service_name = service_name
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(trace.get_tracer(self._service_name), name)
+
+
+TRACER = _LazyTracer(SERVICE_NAME)
 MCP_SERVER = FastMCP("n8n-bridge", json_response=True)
 
 
@@ -384,14 +401,14 @@ class IdempotencyCache:
     def __init__(self, ttl_seconds: float) -> None:
         self._ttl_seconds = ttl_seconds
         self._entries: dict[str, tuple[float, dict[str, object]]] = {}
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
 
     def _purge_expired_locked(self, now: float) -> None:
         self._entries = {k: v for k, v in self._entries.items() if v[0] > now}
 
-    def get(self, key: str) -> dict[str, object] | None:
+    async def get(self, key: str) -> dict[str, object] | None:
         now = time.monotonic()
-        with self._lock:
+        async with self._lock:
             self._purge_expired_locked(now)
             entry = self._entries.get(key)
             if entry is None:
@@ -399,10 +416,10 @@ class IdempotencyCache:
             _, value = entry
             return dict(value)
 
-    def set(self, key: str, value: dict[str, object]) -> None:
+    async def set(self, key: str, value: dict[str, object]) -> None:
         now = time.monotonic()
         expires_at = now + self._ttl_seconds
-        with self._lock:
+        async with self._lock:
             self._purge_expired_locked(now)
             self._entries[key] = (expires_at, dict(value))
 
@@ -418,7 +435,7 @@ def _planning_config_path_kwargs() -> dict[str, str | None]:
 def get_settings() -> BridgeSettings:
     return BridgeSettings(
         host=os.getenv("MCP_HOST", "0.0.0.0"),
-        port=int(os.getenv("MCP_PORT", "8000")),
+        port=os.getenv("MCP_PORT", "8000"),
         n8n_base_url=os.getenv("N8N_BASE_URL", "http://n8n:5678"),
         op_connect_url=os.getenv("OP_CONNECT_URL", "http://1password-connect-api:8080"),
         op_connect_token=os.getenv("OP_CONNECT_TOKEN"),
@@ -428,9 +445,38 @@ def get_settings() -> BridgeSettings:
             "/tmp/n8n-bridge/audit-ledger.jsonl",
         ),
         **_planning_config_path_kwargs(),
-        request_timeout_seconds=float(os.getenv("BRIDGE_REQUEST_TIMEOUT_SECONDS", "15")),
-        idempotency_ttl_seconds=float(os.getenv("BRIDGE_IDEMPOTENCY_TTL_SECONDS", "300")),
+        request_timeout_seconds=os.getenv("BRIDGE_REQUEST_TIMEOUT_SECONDS", "15"),
+        idempotency_ttl_seconds=os.getenv("BRIDGE_IDEMPOTENCY_TTL_SECONDS", "300"),
     )
+
+
+def _span_exporter_from_env() -> SpanExporter:
+    """Use OTLP HTTP when OTEL_EXPORTER_OTLP_ENDPOINT is set (e.g. Alloy); otherwise console for local dev."""
+    otlp_endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
+    if otlp_endpoint:
+        LOGGER.info(
+            json.dumps(
+                {
+                    "level": "INFO",
+                    "event": "otel_tracing.exporter_selected",
+                    "exporter": "otlp_http",
+                    "otlp_endpoint": otlp_endpoint,
+                },
+                sort_keys=True,
+            )
+        )
+        return OTLPSpanExporter()
+    LOGGER.info(
+        json.dumps(
+            {
+                "level": "INFO",
+                "event": "otel_tracing.exporter_selected",
+                "exporter": "console",
+            },
+            sort_keys=True,
+        )
+    )
+    return ConsoleSpanExporter()
 
 
 def configure_telemetry(service_name: str) -> None:
@@ -439,7 +485,7 @@ def configure_telemetry(service_name: str) -> None:
         return
 
     provider = SDKTracerProvider(resource=Resource.create({"service.name": service_name}))
-    provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    provider.add_span_processor(BatchSpanProcessor(_span_exporter_from_env()))
     trace.set_tracer_provider(provider)
 
 
@@ -1534,7 +1580,12 @@ async def trigger_n8n_workflow_impl(
             attributes={"webhook_id": request.webhook_id},
         )
 
-        cached_result = cache.get(idempotency_key)
+        cache_lookup_started = time.perf_counter()
+        cached_result = await cache.get(idempotency_key)
+        span.set_attribute(
+            "bridge.idempotency_cache.get_duration_ms",
+            round((time.perf_counter() - cache_lookup_started) * 1000.0, 3),
+        )
         if cached_result is not None:
             span.set_attribute("bridge.deduplicated", True)
             log_event(
@@ -1579,7 +1630,12 @@ async def trigger_n8n_workflow_impl(
             "response": parse_response_body(response),
             "request_id": request_id,
         }
-        cache.set(idempotency_key, result)
+        cache_set_started = time.perf_counter()
+        await cache.set(idempotency_key, result)
+        span.set_attribute(
+            "bridge.idempotency_cache.set_duration_ms",
+            round((time.perf_counter() - cache_set_started) * 1000.0, 3),
+        )
         write_audit_record(
             settings,
             operation="trigger_n8n_workflow",

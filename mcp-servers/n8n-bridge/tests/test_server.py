@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import respx
@@ -21,25 +23,42 @@ from n8n_bridge.server import (
 )
 
 
-def test_idempotency_cache_purges_expired_on_set_without_get(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tracer_is_lazy_wrapper() -> None:
+    from n8n_bridge.server import _LazyTracer
+
+    assert isinstance(server.TRACER, _LazyTracer)
+    assert callable(server.TRACER.start_as_current_span)
+
+
+@pytest.mark.asyncio
+async def test_idempotency_cache_purges_expired_on_set_without_get(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = IdempotencyCache(ttl_seconds=100.0)
     clock = [0.0]
     monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
-    cache.set("stale", {"v": 1})
+    await cache.set("stale", {"v": 1})
     assert len(cache._entries) == 1
     clock[0] = 200.0
-    cache.set("fresh", {"v": 2})
+    await cache.set("fresh", {"v": 2})
     assert list(cache._entries) == ["fresh"]
 
 
-def test_idempotency_cache_purges_expired_on_get_for_unrelated_key(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_idempotency_cache_purges_expired_on_get_for_unrelated_key(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = IdempotencyCache(ttl_seconds=100.0)
     clock = [0.0]
     monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
-    cache.set("stale", {"v": 1})
+    await cache.set("stale", {"v": 1})
     clock[0] = 200.0
-    assert cache.get("other") is None
+    assert await cache.get("other") is None
     assert cache._entries == {}
+
+
+@pytest.mark.asyncio
+async def test_idempotency_cache_concurrent_reads_do_not_block_event_loop() -> None:
+    cache = IdempotencyCache(ttl_seconds=300.0)
+    await cache.set("k", {"status_code": 200, "response": {}, "request_id": "r1"})
+    results = await asyncio.gather(*(cache.get("k") for _ in range(32)))
+    assert all(r is not None and r["request_id"] == "r1" for r in results)
 
 
 def test_build_idempotency_key_is_order_insensitive() -> None:
@@ -153,6 +172,35 @@ async def test_get_1password_secret_returns_selected_field_value() -> None:
     assert result["field_label"] == "api-key"
     assert result["value"] == "super-secret"
     assert result["request_id"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_1password_secret_raises_value_error_when_field_label_missing() -> None:
+    respx.get("http://1password-connect-api:8080/v1/vaults/vault-dev/items/item-001").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "item-001",
+                "title": "Demo Secret",
+                "fields": [
+                    {"id": "username", "label": "username", "value": "agent"},
+                ],
+            },
+        )
+    )
+    settings = BridgeSettings(
+        op_connect_url="http://1password-connect-api:8080",
+        op_connect_token="development-token",
+    )
+    request = SecretRequest(vault_id="vault-dev", item_id="item-001", field_label="api-key")
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(
+            ValueError,
+            match=r"Field 'api-key' was not found in vault 'vault-dev' item 'item-001'",
+        ):
+            await get_1password_secret_impl(request, settings, client=client)
 
 
 @pytest.mark.asyncio

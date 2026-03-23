@@ -13,6 +13,13 @@ def test_dependency_management_uses_repository_lockfiles() -> None:
     runtime_content = runtime_lock.read_text(encoding="utf-8")
     dev_content = dev_lock.read_text(encoding="utf-8")
 
+    for line in runtime_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("pywin32"):
+            assert 'sys_platform == "win32"' in stripped, (
+                "pywin32 must be Windows-only so Linux CI/Docker can install the lock"
+            )
+
     assert "httpx==0.28.1" in runtime_content
     assert "mcp==1.26.0" in runtime_content
     assert "pydantic==2.12.5" in runtime_content

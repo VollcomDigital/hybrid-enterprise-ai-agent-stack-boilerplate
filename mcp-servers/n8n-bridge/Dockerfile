@@ -12,7 +12,6 @@ RUN useradd --create-home --uid 1000 appuser
 COPY requirements.lock /app/requirements.lock
 COPY pyproject.toml /app/pyproject.toml
 COPY src /app/src
-COPY tests /app/tests
 
 RUN python -m pip install --upgrade pip && \
     python -m pip install --requirement /app/requirements.lock && \

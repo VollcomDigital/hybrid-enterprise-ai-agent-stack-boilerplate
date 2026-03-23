@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Generator
 
 import pytest
+from pydantic import ValidationError
 
 from n8n_bridge.planning_config import (
     PLANNING_CONFIG_BINDINGS,
@@ -102,3 +103,28 @@ def test_get_settings_yields_none_when_no_planning_env_set(
     get_settings.cache_clear()
 
     assert getattr(get_settings(), binding.settings_field) is None
+
+
+def test_get_settings_invalid_mcp_port_raises_validation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_PORT", "not-a-port")
+    get_settings.cache_clear()
+    with pytest.raises(ValidationError):
+        get_settings()
+
+
+def test_get_settings_invalid_request_timeout_raises_validation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BRIDGE_REQUEST_TIMEOUT_SECONDS", "not-a-float")
+    get_settings.cache_clear()
+    with pytest.raises(ValidationError):
+        get_settings()
+
+
+def test_get_settings_coerces_numeric_env_strings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_PORT", "9000")
+    monkeypatch.setenv("BRIDGE_REQUEST_TIMEOUT_SECONDS", "30.5")
+    monkeypatch.setenv("BRIDGE_IDEMPOTENCY_TTL_SECONDS", "120")
+    get_settings.cache_clear()
+    settings = get_settings()
+    assert settings.port == 9000
+    assert settings.request_timeout_seconds == 30.5
+    assert settings.idempotency_ttl_seconds == 120.0

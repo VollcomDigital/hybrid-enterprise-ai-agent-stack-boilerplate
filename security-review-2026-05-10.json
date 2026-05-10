@@ -1,0 +1,37 @@
+{
+  "scan_metadata": {
+    "repository": "VollcomDigital/hybrid-enterprise-ai-agent-stack-boilerplate",
+    "branch": "main",
+    "scan_date": "2026-05-10T09:01:05Z",
+    "scan_type": "at-rest",
+    "agent": "vulnerability-hunter"
+  },
+  "summary": {
+    "total_findings": 1,
+    "critical": 0,
+    "high": 0,
+    "medium": 1
+  },
+  "findings": [
+    {
+      "severity": "medium",
+      "location": "docker-compose.yml:192-214",
+      "description": "The Docker network topology allows the AI code execution sandbox (nemoclaw) and the AI agent (openclaw) to directly access the n8n workflow engine on port 5678, completely bypassing the MCP bridge's policy engine, bearer token authentication, and audit ledger. The MCP bridge (mcp-server-n8n) is designed as the sole authorized gateway to n8n — its production policy enforces `default_action: deny` and restricts `allowed_webhook_ids`. However, since nemoclaw, openclaw, and n8n all share the `app-tier` Docker network, any code running in the sandbox can call `http://n8n:5678/webhook/<id>` directly without authentication or policy checks.",
+      "impact": "An attacker who can influence AI agent behavior (via prompt injection, malicious user instructions, or a compromised workflow) gains the ability to trigger arbitrary n8n webhook workflows without authorization. This bypasses the allow-list restriction on webhook IDs, evades audit logging, and provides access to any automation workflow configured in n8n — which may interact with databases (Postgres credentials are in n8n's environment), external APIs, or internal services.",
+      "verified": true,
+      "attack_path": "1. Attacker provides a prompt injection payload or malicious instruction to the OpenClaw AI agent.\n2. The AI agent generates code to be executed in the nemoclaw sandbox container.\n3. The sandbox code makes a direct HTTP POST to `http://n8n:5678/webhook/<target-webhook-id>` with an arbitrary payload.\n4. N8N webhook endpoints respond without authentication (by design — they're meant to be triggered by trusted internal callers).\n5. The webhook triggers an n8n workflow which may access Postgres, call external APIs, or perform privileged automation.\n6. The MCP bridge's policy engine, bearer token check, and audit ledger are completely bypassed — no record of the unauthorized invocation exists.",
+      "evidence": [
+        "docker-compose.yml:192-194 (openclaw networks: app-tier, ai-tier)",
+        "docker-compose.yml:212-214 (nemoclaw networks: app-tier, ai-tier)",
+        "docker-compose.yml:339-342 (n8n networks: proxy-tier, app-tier, db-tier)",
+        "docker-compose.yml:395-396 (mcp-server-n8n networks: app-tier only)",
+        "docker-compose.yml:426-428 (app-tier: internal: true — all containers on it can communicate)",
+        "infrastructure/policy/mcp-policy.prod.json:3 (default_action: deny — intended to restrict access)",
+        "mcp-servers/n8n-bridge/src/n8n_bridge/server.py:1570 (webhook_url constructed for proxied calls)"
+      ],
+      "remediation": "Isolate n8n on a dedicated network that only the MCP bridge can reach. Remove n8n from `app-tier` and create a new internal network (e.g., `bridge-n8n-tier`) shared exclusively between `mcp-server-n8n` and `n8n`. This enforces the policy boundary at the network level.\n\n```yaml\n# Add to networks section:\nbridge-n8n-tier:\n  name: hybrid_bridge_n8n_tier\n  internal: true\n\n# Update n8n service networks:\nn8n:\n  networks:\n    - proxy-tier      # Traefik ingress for UI\n    - bridge-n8n-tier # MCP bridge webhook access only\n    - db-tier         # Postgres access\n\n# Update mcp-server-n8n service networks:\nmcp-server-n8n:\n  networks:\n    - app-tier         # Reachable by openclaw as MCP client\n    - bridge-n8n-tier  # Sole path to n8n webhooks\n```\n\nThis ensures the only path from the AI agent to n8n is through the MCP bridge's authenticated, policy-controlled, audit-logged interface.",
+      "poc_video_url": null,
+      "poc_video_notes": "PoC video is not feasible in this environment because the Docker stack is not running and cannot be instantiated in the CI/review context. The finding is validated through static analysis of the Docker Compose network topology and confirmed by reading the MCP bridge source code to verify that no alternative network-level enforcement exists."
+    }
+  ]
+}
